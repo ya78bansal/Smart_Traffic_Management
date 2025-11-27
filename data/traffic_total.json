@@ -1,8 +1,11 @@
 [
     {
-        "car": 20,
-        "bus": 8,
+        "car": 1,
+        "bus": 0,
         "bike": 0,
-        "person": 32
+        "person": 0,
+        "ambulance": false,
+        "accident": false,
+        "timestamp": "22:44:25"
     }
 ]

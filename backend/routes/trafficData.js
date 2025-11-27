@@ -1,11 +1,12 @@
+// backend/routes/trafficData.js
 const express = require('express');
 const router = express.Router();
 const trafficController = require('../controllers/trafficController');
 
-// Existing routes
+// Returns latest traffic snapshot for initial graph
 router.get('/', trafficController.getTrafficData);
 
-// Add this POST route!
+// Already existing
 router.post('/signal-decision', trafficController.postSignalDecision);
 
 module.exports = router;

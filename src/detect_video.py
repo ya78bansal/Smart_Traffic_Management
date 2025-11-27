@@ -1,163 +1,66 @@
 import cv2
 import datetime
 import numpy as np
-import csv
+import json
 import os
-from src.sort import Sort  # Correct import for your structure
-from ultralytics import YOLO  # pip install ultralytics
+from ultralytics import YOLO
+from src.sort import Sort
 
-vehicle_classes = ['car', 'motorcycle', 'bus', 'person', 'bike']
-
-# Load YOLO model once
+vehicle_classes = ["car", "motorcycle", "bus", "person", "bike", "ambulance", "accident"]
 model = YOLO("../models/yolov8n.pt")
 
-def detect_video(video_path, output_video_path=None, log_csv_path=None, show_window=False):
+def detect_video(video_path):
     cap = cv2.VideoCapture(video_path)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = None
-    csv_writer = None
-
-    if log_csv_path:
-        csv_file = open(log_csv_path, mode="w", newline="")
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["timestamp", "frame_id", "track_id", "class", "confidence", "x1", "y1", "x2", "y2"])
-
     frame_id = 0
-    cumulative_counts = {}
-    cumulative_total = 0
-    tracker = Sort()
-    counted_ids = set()
-    track_last_positions = {}
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
+
         frame_id += 1
-        h, w = frame.shape[:2]
+        results = model(frame)[0]
 
-        # ROI: bigger horizontal strip of right half
-        y_start = int(h * 0.4)
-        y_end = int(h * 0.8)
-        roi = frame[y_start:y_end, w//2:]
-        roi_x_offset = w // 2
-        roi_y_offset = y_start
+        live_counts = {"car":0, "bus":0, "bike":0, "person":0}
+        ambulance_detected = False
+        accident_detected = False
 
-        results = model(roi)[0]
-        boxes = results.boxes
-        names = results.names
+        for box in results.boxes:
+            cls = int(box.cls[0])
+            label = results.names[cls]
 
-        detections = []
-        if boxes is not None and boxes.shape[0] > 0:
-            boxes_np = boxes.xyxy.cpu().numpy()
-            confs_np = boxes.conf.cpu().numpy()
-            clss_np = boxes.cls.cpu().numpy().astype(int)
+            if label in ["car"]:
+                live_counts["car"] += 1
+            elif label in ["bus"]:
+                live_counts["bus"] += 1
+            elif label in ["motorcycle", "bike"]:
+                live_counts["bike"] += 1
+            elif label == "person":
+                live_counts["person"] += 1
+            elif label == "ambulance":
+                ambulance_detected = True
+            elif label == "accident":
+                accident_detected = True
 
-            for i in range(len(boxes_np)):
-                class_id = clss_np[i]
-                label = names[class_id]
-                conf = confs_np[i]
-                if label in vehicle_classes and conf > 0.2:
-                    xmin = boxes_np[i][0] + roi_x_offset
-                    ymin = boxes_np[i][1] + roi_y_offset
-                    xmax = boxes_np[i][2] + roi_x_offset
-                    ymax = boxes_np[i][3] + roi_y_offset
-                    detections.append([xmin, ymin, xmax, ymax, conf, label])
+        if frame_id % 30 == 0:
+            live_data = {
+                "car": live_counts["car"],
+                "bus": live_counts["bus"],
+                "bike": live_counts["bike"],
+                "person": live_counts["person"],
+                "ambulance": ambulance_detected,
+                "accident": accident_detected,
+                "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
+            }
 
-        dets = np.array([d[:5] for d in detections])
-        tracked_objects = tracker.update(dets) if len(dets) > 0 else np.empty((0,5))
+            os.makedirs("data", exist_ok=True)
+            with open("data/traffic_total.json", "w") as f:
+                json.dump([live_data], f, indent=4)
 
-        # Counting line logic
-        counting_line_y = int(y_start + (y_end - y_start) * 0.5)
-        annotated_frame = frame.copy()
-        cv2.line(annotated_frame, (roi_x_offset, counting_line_y), (w, counting_line_y), (0,0,255), 2)
-
-        current_ids = set()
-        for track in tracked_objects:
-            x1, y1, x2, y2, track_id = track
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
-            current_ids.add(track_id)
-            prev_cy = track_last_positions.get(track_id, None)
-            track_last_positions[track_id] = cy
-
-            # IoU match for class assignment
-            best_match = None
-            best_iou = 0
-            for det in detections:
-                dx1, dy1, dx2, dy2, dconf, dlabel = det
-                xx1 = max(x1, dx1)
-                yy1 = max(y1, dy1)
-                xx2 = min(x2, dx2)
-                yy2 = min(y2, dy2)
-                w_inter = max(0, xx2 - xx1)
-                h_inter = max(0, yy2 - yy1)
-                inter = w_inter * h_inter
-                area1 = (x2 - x1) * (y2 - y1)
-                area2 = (dx2 - dx1) * (dy2 - dy1)
-                union = area1 + area2 - inter
-                iou = inter / union if union > 0 else 0
-                if iou > best_iou:
-                    best_iou = iou
-                    best_match = det
-
-            # Count only when center crosses the line
-            if prev_cy is not None and prev_cy < counting_line_y and cy >= counting_line_y:
-                if int(track_id) not in counted_ids:
-                    counted_ids.add(int(track_id))
-                    if best_match is not None:
-                        label = best_match[5]
-                        conf = best_match[4]
-                        cumulative_counts[label] = cumulative_counts.get(label, 0) + 1
-                        cumulative_total += 1
-
-            # CSV logging
-            if csv_writer:
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                csv_writer.writerow([
-                    timestamp, frame_id, int(track_id),
-                    best_match[5] if best_match else "unknown",
-                    round(float(best_match[4]),2) if best_match else 0,
-                    int(x1), int(y1), int(x2), int(y2)
-                ])
-
-            # Draw rectangle and label
-            box_label = f"ID:{int(track_id)}"
-            if best_match is not None:
-                box_label += f" {best_match[5]} {best_match[4]:.2f}"
-            cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(annotated_frame, box_label, (int(x1), int(y1)-5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
-
-        track_last_positions = {tid: pos for tid, pos in track_last_positions.items() if tid in current_ids}
-
-        # Display cumulative counts
-        y_disp = 30
-        for label, count in cumulative_counts.items():
-            text = f"{label}: {count}"
-            cv2.putText(annotated_frame, text, (10, y_disp),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-            y_disp += 30
-        cv2.putText(annotated_frame, f"Total: {cumulative_total}", (10, y_disp+10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
-
-        if output_video_path and out is None:
-            out = cv2.VideoWriter(output_video_path, fourcc, 20.0, (w,h))
-        if out:
-            out.write(annotated_frame)x 
-
-        # Show video pop-up if enabled
-        if show_window:
-            cv2.imshow('Annotated Frame', annotated_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            print("LIVE JSON:", live_data)
 
     cap.release()
-    if out is not None:
-        out.release()
-    if csv_writer:
-        csv_file.close()
-    if show_window:
-        cv2.destroyAllWindows()
 
-    return cumulative_counts
+if __name__ == "__main__":
+    import sys
+    detect_video(sys.argv[1])
